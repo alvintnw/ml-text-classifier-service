@@ -1,0 +1,1163 @@
+{
+  "name": "ML Text Classifier Service (Naive Bayes, retraining, monitoring)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## ML Text Classifier Service\nA complete machine-learning loop inside n8n: serve predictions, collect corrections, retrain on a schedule, and only promote a model that is not worse than the one in production.\n\n**Endpoints** (header `X-API-Key`):\n- POST `/webhook/ml-predict` {text}\n- POST `/webhook/ml-feedback` {prediction_id, label}\n- POST `/webhook/ml-examples` {examples:[{text,label}]}\n\n**Before running:**\n1. Run sql/schema.sql, then sql/seed_examples.sql (optional)\n2. Credentials: Postgres, Telegram, 'ML API key' (Header Auth, name `X-API-Key`, your own secret)\n3. Replace `REPLACE_WITH_ALERT_CHAT_ID`\n4. Set 'Error Workflow' to this workflow\n5. Run 'Manual Train' once, then activate",
+        "height": 440,
+        "width": 700,
+        "color": 4
+      },
+      "id": "af0bbab0-d519-463a-990b-9cae8a6ca30f",
+      "name": "Notes - General",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -160,
+        -340
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Champion / challenger\nThe holdout is fixed: 1 in 5 examples by id hash, so no model ever trains on it. The challenger and the serving model are scored on the same holdout. A challenger is promoted only if accuracy >= 0.6 and macro F1 >= champion - 0.005. Promotion is one SQL statement that moves the `active_model` pointer. Rejected runs are logged without the model blob.",
+        "height": 220,
+        "width": 600,
+        "color": 5
+      },
+      "id": "cd60b067-86b2-47d1-b56b-fffab5366109",
+      "name": "Notes - Training",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        700,
+        1060
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### The model\nMultinomial Naive Bayes on word unigrams and bigrams (Laplace smoothing, top 4000 features). Probabilities are softened with a length-based temperature because Naive Bayes is over-confident on long texts. Confidence below 0.6 is flagged `low_confidence` for human review.",
+        "height": 200,
+        "width": 520,
+        "color": 6
+      },
+      "id": "7fd0328c-62b8-4a90-8998-695aada97f6c",
+      "name": "Notes - Model",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        -140
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ml-predict",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "d1a926b2-d1f2-48df-964c-c593675ccb81",
+      "name": "Predict Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ID",
+          "name": "ML API key"
+        }
+      },
+      "webhookId": "2cad84b0-ab05-4155-850d-22a17a85174d"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const b = $input.first().json.body;\nconst text = b && typeof b.text === 'string' ? b.text.replace(/\\u0000/g, '').trim() : '';\nif (!text) return [{ json: { valid: false, reason: 'Body must be JSON like {\"text\": \"...\"} with a non-empty string' } }];\nif (text.length > 5000) return [{ json: { valid: false, reason: 'text must be at most 5000 characters' } }];\nreturn [{ json: { valid: true, text } }];"
+      },
+      "id": "d8ac01f7-4415-40d5-a051-559537d605a9",
+      "name": "Validate Predict",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "83c27237-fe13-4874-8602-6f9aaf229838",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d15e9237-6cf2-4e3f-b73f-20fa88b17b61",
+      "name": "Predict Input Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        520,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'rejected', error: $json.reason } }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "d17f7d89-cce0-4d4d-a806-07d406b73b30",
+      "name": "Respond Bad Request",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        780,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT m.id, m.model\nFROM active_model a\nJOIN models m ON m.id = a.model_id;",
+        "options": {}
+      },
+      "id": "fcaade20-f1ba-4060-b887-076acb616737",
+      "name": "Load Active Model",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        780,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "9702cb92-9eda-4ee4-8394-50f7491f2452",
+              "leftValue": "={{ !!$json.id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c2581c67-caed-4f09-ac6c-4b769aa982b9",
+      "name": "Model Available?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1040,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'unavailable', error: 'No trained model yet' } }}",
+        "options": {
+          "responseCode": 503
+        }
+      },
+      "id": "33216bd7-1cfb-41b9-9887-a9281b976d05",
+      "name": "Respond No Model",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1300,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const tokenize = text => {\n  const words = (String(text).toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '').match(/[a-z0-9]+/g) || [])\n    .filter(w => w.length >= 2);\n  const out = words.slice();\n  for (let i = 0; i < words.length - 1; i++) out.push(words[i] + '_' + words[i + 1]);   // unigrams and bigrams\n  return out;\n};\nconst has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);\n// Naive Bayes posterior. Returns null when no word of the text is known to the model.\nconst scoreText = (model, text) => {\n  const counts = new Map();\n  for (const t of tokenize(text)) if (has(model.vocab, t)) counts.set(t, (counts.get(t) || 0) + 1);\n  let matched = 0;\n  const score = model.log_prior.slice();\n  for (const [t, n] of counts) {\n    matched += n;\n    const ll = model.vocab[t];\n    for (let c = 0; c < score.length; c++) score[c] += n * ll[c];\n  }\n  if (!matched) return null;\n  // Naive Bayes is over-confident on long texts: soften the posterior with a length-based temperature\n  const T = Math.max(1, matched / 8);\n  const max = Math.max(...score);\n  const exps = score.map(s => Math.exp((s - max) / T));\n  const Z = exps.reduce((a, b) => a + b, 0);\n  return { matched, probs: exps.map(e => e / Z) };\n};\nconst LOW_CONFIDENCE = 0.6;   // below this the answer is flagged for human review\nconst row = $input.first().json;\nconst text = $('Validate Predict').first().json.text;\nconst model = row.model;\nconst r = scoreText(model, text);\nif (!r) {\n  return [{ json: { model_id: row.id, label: null, confidence: 0, low_confidence: true,\n    alternatives: [], probs_json: '[]', reason: 'no known words in the text' } }];\n}\nconst ranked = model.classes.map((label, i) => ({ label, probability: Math.round(r.probs[i] * 10000) / 10000 }))\n  .sort((a, b) => b.probability - a.probability);\nreturn [{ json: {\n  model_id: row.id,\n  label: ranked[0].label,\n  confidence: ranked[0].probability,\n  low_confidence: ranked[0].probability < LOW_CONFIDENCE,\n  alternatives: ranked.slice(0, 3),\n  probs_json: JSON.stringify(ranked.slice(0, 5)),\n  reason: null\n} }];"
+      },
+      "id": "30b7d8af-39a3-49e6-9b67-683c09a41a4f",
+      "name": "Predict",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO predictions (model_id, text, label, confidence, low_confidence, probs)\nVALUES ($1::int, left($2::text, 2000), $3::text, $4::numeric, $5::boolean, $6::jsonb)\nRETURNING id;",
+        "options": {
+          "queryReplacement": "={{ [ $json.model_id, $('Validate Predict').first().json.text, $json.label, $json.confidence, $json.low_confidence, $json.probs_json ] }}"
+        }
+      },
+      "id": "91fd2a51-e2e2-4d16-8be4-0c99f923659b",
+      "name": "Log Prediction",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1560,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { prediction_id: $json.id, label: $('Predict').first().json.label, confidence: $('Predict').first().json.confidence, low_confidence: $('Predict').first().json.low_confidence, alternatives: $('Predict').first().json.alternatives, model_id: $('Predict').first().json.model_id } }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "b0645ed2-02eb-4d3a-900d-5e2eee7755d1",
+      "name": "Respond Prediction",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1820,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ml-feedback",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "517884d5-7ecf-420b-acc5-0055e5cea9a7",
+      "name": "Feedback Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        700
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ID",
+          "name": "ML API key"
+        }
+      },
+      "webhookId": "affe68e8-d345-4c92-93e0-24f6cb4b3dce"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const b = $input.first().json.body || {};\nconst id = Number(b.prediction_id);\nconst label = typeof b.label === 'string' ? b.label.trim() : '';\nif (!Number.isInteger(id) || id < 1 || id > 9007199254740991) return [{ json: { valid: false, reason: 'prediction_id must be a positive integer' } }];\nif (!/^[A-Za-z0-9][A-Za-z0-9 _.-]{0,49}$/.test(label)) return [{ json: { valid: false, reason: 'label must be 1-50 characters: letters, digits, space, dot, dash, underscore' } }];\nreturn [{ json: { valid: true, prediction_id: id, label } }];"
+      },
+      "id": "f9eb555d-238e-4a63-beb0-831e5b368c27",
+      "name": "Validate Feedback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "4d62a10c-3990-4587-a7cd-c53a950d7d82",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "2b0e0508-12fd-4b55-984e-22a598ebcf0e",
+      "name": "Feedback Input Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        520,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH p AS (\n  SELECT id, text, label FROM predictions WHERE id = $1::bigint\n),\nknown AS (\n  SELECT EXISTS (SELECT 1 FROM examples WHERE label = $2::text) AS ok\n),\nfb AS (\n  UPDATE predictions SET feedback_label = $2::text, feedback_at = now()\n  WHERE id = $1::bigint AND (SELECT ok FROM known)\n  RETURNING id\n),\nex AS (\n  INSERT INTO examples (text, label, source)\n  SELECT text, $2::text, 'feedback' FROM p WHERE (SELECT ok FROM known)\n  ON CONFLICT (text_hash) DO UPDATE SET label = EXCLUDED.label, source = 'feedback'\n  RETURNING id\n)\nSELECT (SELECT COUNT(*)::int FROM p)  AS found,\n       (SELECT ok FROM known)         AS known_label,\n       (SELECT label FROM p)          AS predicted,\n       (SELECT COUNT(*)::int FROM fb) AS saved;",
+        "options": {
+          "queryReplacement": "={{ [ $json.prediction_id, $json.label ] }}"
+        }
+      },
+      "id": "efa0d582-b93d-4092-bc67-6284b1109c5f",
+      "name": "Save Feedback",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        780,
+        700
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json.found === 0 ? { status: 'not_found', error: 'Unknown prediction_id' } : !$json.known_label ? { status: 'unknown_label', error: 'Label is not used by any training example. Add it with the examples endpoint first.' } : { status: 'saved', predicted: $json.predicted } }}",
+        "options": {
+          "responseCode": "={{ $json.found === 0 ? 404 : !$json.known_label ? 422 : 200 }}"
+        }
+      },
+      "id": "6f0e0420-9e91-4d58-a2f4-0b9cb87e5600",
+      "name": "Respond Feedback",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1040,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ml-examples",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "619fecd0-4ef6-4d31-8fbe-4239305431fe",
+      "name": "Examples Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        1000
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ID",
+          "name": "ML API key"
+        }
+      },
+      "webhookId": "e67e4f3f-e8ee-495c-8e79-fbb80e73ee61"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const b = $input.first().json.body || {};\nconst list = Array.isArray(b.examples) ? b.examples : null;\nif (!list || list.length < 1 || list.length > 200) return [{ json: { valid: false, reason: 'examples must be an array of 1 to 200 items' } }];\nconst seen = new Map();\nfor (const [i, e] of list.entries()) {\n  const text = e && typeof e.text === 'string' ? e.text.replace(/\\u0000/g, '').trim() : '';\n  const label = e && typeof e.label === 'string' ? e.label.trim() : '';\n  if (!text || text.length > 2000) return [{ json: { valid: false, reason: 'examples[' + i + '].text must be 1-2000 characters' } }];\n  if (!/^[A-Za-z0-9][A-Za-z0-9 _.-]{0,49}$/.test(label)) return [{ json: { valid: false, reason: 'examples[' + i + '].label is invalid' } }];\n  seen.set(text, label);   // the last label for a repeated text wins\n}\nreturn [{ json: { valid: true, examples_json: JSON.stringify([...seen].map(([text, label]) => ({ text, label }))) } }];"
+      },
+      "id": "e7318794-525e-41c7-b0be-b9a842f30e0d",
+      "name": "Validate Examples",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        1000
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "dec90be6-3f61-450a-af0d-6dddb7a98e58",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "1e6557dc-edb8-4504-9d54-25449542afee",
+      "name": "Examples Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        520,
+        1000
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH input AS (\n  SELECT * FROM json_to_recordset($1::json) AS x(text text, label text)\n),\nup AS (\n  INSERT INTO examples (text, label, source)\n  SELECT text, label, 'bulk' FROM input\n  ON CONFLICT (text_hash) DO UPDATE SET label = EXCLUDED.label\n  WHERE examples.label <> EXCLUDED.label\n  RETURNING (xmax = 0) AS inserted\n)\nSELECT (SELECT COUNT(*)::int FROM input)                       AS received,\n       (SELECT COUNT(*) FILTER (WHERE inserted)::int FROM up)  AS inserted,\n       (SELECT COUNT(*) FILTER (WHERE NOT inserted)::int FROM up) AS relabeled,\n       -- a statement sees the table as it was before it ran, so add the rows inserted by this statement\n       ((SELECT COUNT(*) FROM examples) + (SELECT COUNT(*) FILTER (WHERE inserted) FROM up))::int AS total_examples;",
+        "options": {
+          "queryReplacement": "={{ [ $json.examples_json ] }}"
+        }
+      },
+      "id": "b2777416-f111-4702-a970-48cef9c7a61e",
+      "name": "Insert Examples",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        780,
+        1000
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'saved', received: $json.received, inserted: $json.inserted, relabeled: $json.relabeled, total_examples: $json.total_examples } }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "3812f1af-d792-454e-8375-1d2f16387e14",
+      "name": "Respond Examples",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1040,
+        1000
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 3 * * *"
+            }
+          ]
+        }
+      },
+      "id": "238f0f5c-2af9-4595-a390-7e1bbebfcc45",
+      "name": "Daily Training Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        1400
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "6c3bb9be-923e-4a75-8de2-480c8e1b87c1",
+      "name": "Manual Train",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        1560
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, text, label FROM examples ORDER BY id;",
+        "options": {}
+      },
+      "id": "40f76cfc-7fa2-4cf3-80c6-34e1400d76e4",
+      "name": "Load Examples",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        260,
+        1480
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT m.id, m.model\nFROM active_model a\nJOIN models m ON m.id = a.model_id;",
+        "options": {}
+      },
+      "id": "62d456f5-ddc8-43fa-96cd-66cb8d9256c0",
+      "name": "Load Champion",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        520,
+        1480
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const tokenize = text => {\n  const words = (String(text).toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '').match(/[a-z0-9]+/g) || [])\n    .filter(w => w.length >= 2);\n  const out = words.slice();\n  for (let i = 0; i < words.length - 1; i++) out.push(words[i] + '_' + words[i + 1]);   // unigrams and bigrams\n  return out;\n};\nconst has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);\n// Naive Bayes posterior. Returns null when no word of the text is known to the model.\nconst scoreText = (model, text) => {\n  const counts = new Map();\n  for (const t of tokenize(text)) if (has(model.vocab, t)) counts.set(t, (counts.get(t) || 0) + 1);\n  let matched = 0;\n  const score = model.log_prior.slice();\n  for (const [t, n] of counts) {\n    matched += n;\n    const ll = model.vocab[t];\n    for (let c = 0; c < score.length; c++) score[c] += n * ll[c];\n  }\n  if (!matched) return null;\n  // Naive Bayes is over-confident on long texts: soften the posterior with a length-based temperature\n  const T = Math.max(1, matched / 8);\n  const max = Math.max(...score);\n  const exps = score.map(s => Math.exp((s - max) / T));\n  const Z = exps.reduce((a, b) => a + b, 0);\n  return { matched, probs: exps.map(e => e / Z) };\n};\nconst MIN_EXAMPLES = 30, MIN_PER_CLASS = 5, MIN_TEST = 10;\nconst MIN_ACCURACY = 0.6;      // a model below this is never promoted\nconst TOLERANCE = 0.005;       // challenger may be this much worse in macro F1 and still replace the champion\nconst MAX_FEATURES = 4000, ALPHA = 1, TEST_MOD = 5;   // 1 of 5 examples (by id hash) is the fixed holdout\n\nconst rows = $('Load Examples').all().map(i => i.json).filter(r => r && r.id !== undefined && r.text && r.label);\nconst champRow = $('Load Champion').first().json;\nconst champion = champRow && champRow.model ? champRow.model : null;\n\nconst result = o => [{ json: { trained: false, decision: 'skipped', promoted: false, n_train: 0, n_test: 0,\n  classes_json: '[]', metrics_json: '{}', champion_metrics_json: 'null', model_json: 'null', ...o } }];\n\n// 1. keep classes with enough examples\nconst perClass = {};\nfor (const r of rows) perClass[r.label] = (perClass[r.label] || 0) + 1;\nconst keep = new Set(Object.keys(perClass).filter(l => perClass[l] >= MIN_PER_CLASS));\nconst dropped = Object.keys(perClass).filter(l => !keep.has(l));\nlet data = rows.filter(r => keep.has(r.label));\nif (data.length < MIN_EXAMPLES || keep.size < 2) {\n  return result({ reason: 'Not enough data: need ' + MIN_EXAMPLES + ' examples in at least 2 classes with ' + MIN_PER_CLASS + '+ examples each (have ' + data.length + ' in ' + keep.size + ')', dropped });\n}\n\n// 2. fixed split by id hash: an example never moves between train and holdout\nconst isTest = r => (Math.imul(Number(r.id) | 0, 2654435761 | 0) >>> 0) % TEST_MOD === 0;\nlet train = data.filter(r => !isTest(r)), test = data.filter(isTest);\nconst trainPerClass = {};\nfor (const r of train) trainPerClass[r.label] = (trainPerClass[r.label] || 0) + 1;\nconst classes = [...keep].filter(l => (trainPerClass[l] || 0) >= 2).sort();\nif (classes.length < 2) return result({ reason: 'Fewer than 2 classes have enough training examples after the split', dropped });\ntrain = train.filter(r => classes.includes(r.label));\ntest = test.filter(r => classes.includes(r.label));\nif (test.length < MIN_TEST) return result({ reason: 'Holdout too small (' + test.length + ' examples, need ' + MIN_TEST + ')', dropped });\n\n// 3. train multinomial Naive Bayes on unigrams and bigrams\nconst df = new Map();\nconst docs = train.map(r => ({ c: classes.indexOf(r.label), toks: tokenize(r.text) }));\nfor (const d of docs) for (const t of new Set(d.toks)) df.set(t, (df.get(t) || 0) + 1);\nconst vocabList = [...df.entries()].filter(([, n]) => n >= 2).sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).slice(0, MAX_FEATURES).map(([t]) => t);\nif (!vocabList.length) return result({ reason: 'No word appears in at least 2 training examples', dropped });\nconst idx = new Map(vocabList.map((t, i) => [t, i]));\nconst tc = classes.map(() => new Float64Array(vocabList.length));\nconst total = classes.map(() => 0);\nconst nDocs = classes.map(() => 0);\nfor (const d of docs) {\n  nDocs[d.c]++;\n  for (const t of d.toks) { const i = idx.get(t); if (i !== undefined) { tc[d.c][i]++; total[d.c]++; } }\n}\nconst V = vocabList.length;\nconst r4 = x => Math.round(x * 1e4) / 1e4;\nconst vocab = {};\nvocabList.forEach((t, i) => { vocab[t] = classes.map((_, c) => r4(Math.log((tc[c][i] + ALPHA) / (total[c] + ALPHA * V)))); });\nconst model = { algo: 'multinomial_naive_bayes', classes, log_prior: nDocs.map(n => r4(Math.log(n / docs.length))), vocab };\n\n// 4. evaluate on the holdout\nconst evaluate = (m) => {\n  const cls = [...new Set([...classes, ...(m ? m.classes : [])])];\n  const tp = {}, fp = {}, fn = {}, sup = {};\n  for (const c of cls) { tp[c] = 0; fp[c] = 0; fn[c] = 0; sup[c] = 0; }\n  let right = 0;\n  for (const r of test) {\n    const s = m ? scoreText(m, r.text) : null;\n    const pred = s ? m.classes[s.probs.indexOf(Math.max(...s.probs))] : null;\n    sup[r.label]++;\n    if (pred === r.label) { right++; tp[r.label]++; } else { fn[r.label]++; if (pred !== null) fp[pred]++; }\n  }\n  const per = {}; let f1sum = 0, n = 0;\n  for (const c of cls) {\n    if (!sup[c] && !fp[c]) continue;\n    const p = tp[c] + fp[c] ? tp[c] / (tp[c] + fp[c]) : 0, rc = sup[c] ? tp[c] / sup[c] : 0;\n    const f1 = p + rc ? 2 * p * rc / (p + rc) : 0;\n    per[c] = { precision: r4(p), recall: r4(rc), f1: r4(f1), support: sup[c] };\n    if (sup[c]) { f1sum += f1; n++; }\n  }\n  return { accuracy: r4(right / test.length), macro_f1: r4(n ? f1sum / n : 0), per_class: per };\n};\nconst metrics = evaluate(model);\nconst champMetrics = champion ? evaluate(champion) : null;\n\n// 5. promotion gate\nlet promoted, reason;\nif (metrics.accuracy < MIN_ACCURACY) { promoted = false; reason = 'Accuracy ' + metrics.accuracy + ' is below the minimum ' + MIN_ACCURACY; }\nelse if (!champion) { promoted = true; reason = 'First model'; }\nelse if (metrics.macro_f1 >= champMetrics.macro_f1 - TOLERANCE) { promoted = true; reason = 'Macro F1 ' + metrics.macro_f1 + ' vs champion ' + champMetrics.macro_f1 + ' on the same holdout'; }\nelse { promoted = false; reason = 'Challenger macro F1 ' + metrics.macro_f1 + ' is worse than champion ' + champMetrics.macro_f1; }\n\nreturn [{ json: { trained: true, decision: promoted ? 'promoted' : 'rejected', promoted, reason,\n  n_train: train.length, n_test: test.length, dropped, features: V,\n  classes_json: JSON.stringify(classes), metrics_json: JSON.stringify(metrics),\n  champion_metrics_json: JSON.stringify(champMetrics), model_json: JSON.stringify(model) } }];"
+      },
+      "id": "915ae598-a0db-4eb0-bc68-ef571c607d21",
+      "name": "Train & Evaluate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        1480
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "a7eb6b2a-32f6-4689-859f-6b23ba37d596",
+              "leftValue": "={{ $json.trained }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "18b7af4e-991c-4a5b-b8de-5a3b00c4451e",
+      "name": "Model Trained?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1040,
+        1480
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH ins AS (\n  INSERT INTO models (n_train, n_test, classes, metrics, champion_metrics, promoted, reason, model)\n  VALUES ($1::int, $2::int, ARRAY(SELECT json_array_elements_text($3::json)), $4::jsonb, $5::jsonb,\n          $6::boolean, $7::text, CASE WHEN $6::boolean THEN $8::jsonb END)\n  RETURNING id, promoted\n),\nptr AS (\n  INSERT INTO active_model (singleton, model_id, promoted_at)\n  SELECT TRUE, id, now() FROM ins WHERE promoted\n  ON CONFLICT (singleton) DO UPDATE SET model_id = EXCLUDED.model_id, promoted_at = EXCLUDED.promoted_at\n  RETURNING model_id\n)\nSELECT id AS model_id, promoted FROM ins;",
+        "options": {
+          "queryReplacement": "={{ [ $json.n_train, $json.n_test, $json.classes_json, $json.metrics_json, $json.champion_metrics_json, $json.promoted, $json.reason, $json.model_json ] }}"
+        }
+      },
+      "id": "9d8b7b38-3dea-4683-8843-6081fb7c78aa",
+      "name": "Save Model",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1300,
+        1400
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const t = $('Train & Evaluate').first().json;\nconst saved = $input.first().json || {};\nconst esc = s => String(s === null || s === undefined ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst lines = [];\nif (!t.trained) {\n  lines.push('🧠 <b>Training skipped</b>', esc(t.reason));\n} else {\n  const m = JSON.parse(t.metrics_json), c = JSON.parse(t.champion_metrics_json);\n  lines.push((t.promoted ? '✅ <b>New model promoted</b>' : '⛔ <b>Model rejected</b>') + (saved.model_id ? ' (#' + saved.model_id + ')' : ''));\n  lines.push(esc(t.reason), '');\n  lines.push('Train/holdout: ' + t.n_train + ' / ' + t.n_test + ', features: ' + t.features);\n  lines.push('Accuracy: ' + m.accuracy + ', macro F1: ' + m.macro_f1 + (c ? ' (champion ' + c.macro_f1 + ')' : ''));\n  const weak = Object.entries(m.per_class).filter(([, v]) => v.support && v.f1 < 0.6).map(([k, v]) => k + ' (F1 ' + v.f1 + ')');\n  if (weak.length) lines.push('Weak classes: ' + esc(weak.join(', ')));\n}\nif (t.dropped && t.dropped.length) lines.push('Ignored (fewer than 5 examples): ' + esc(t.dropped.join(', ')));\nreturn [{ json: { text: lines.join('\\n') } }];"
+      },
+      "id": "fa4d1b9e-358b-4c06-9b70-cfffa7e74f0b",
+      "name": "Format Training Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        1480
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "REPLACE_WITH_ALERT_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "45513bf3-1ae7-4613-8d64-1641a2cd221e",
+      "name": "Send Training Report",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1820,
+        1480
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ID",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      },
+      "id": "172a6243-0735-4e1b-b641-47e3381db0b7",
+      "name": "Daily Monitor Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        1900
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  (SELECT COUNT(*)::int FROM predictions WHERE created_at > now() - interval '24 hours') AS n_24h,\n  (SELECT COALESCE(ROUND(AVG(confidence), 3), 0) FROM predictions\n     WHERE created_at > now() - interval '24 hours') AS avg_confidence,\n  (SELECT COALESCE(ROUND(AVG(low_confidence::int), 3), 0) FROM predictions\n     WHERE created_at > now() - interval '24 hours') AS low_confidence_rate,\n  (SELECT COUNT(*)::int FROM predictions\n     WHERE feedback_label IS NOT NULL AND feedback_at > now() - interval '7 days') AS n_feedback_7d,\n  (SELECT ROUND(AVG(COALESCE(label = feedback_label, FALSE)::int), 3) FROM predictions\n     WHERE feedback_label IS NOT NULL AND feedback_at > now() - interval '7 days') AS feedback_accuracy,\n  (SELECT COUNT(*)::int FROM predictions\n     WHERE created_at <= now() - interval '24 hours' AND created_at > now() - interval '8 days') AS n_baseline,\n  (SELECT ROUND((0.5 * COALESCE(SUM(ABS(COALESCE(c.p, 0) - COALESCE(b.p, 0))), 0))::numeric, 3) FROM\n     (SELECT COALESCE(label, '(none)') AS label, COUNT(*)::float / SUM(COUNT(*)) OVER () AS p\n        FROM predictions WHERE created_at > now() - interval '24 hours' GROUP BY 1) c\n     FULL JOIN\n     (SELECT COALESCE(label, '(none)') AS label, COUNT(*)::float / SUM(COUNT(*)) OVER () AS p\n        FROM predictions WHERE created_at <= now() - interval '24 hours' AND created_at > now() - interval '8 days' GROUP BY 1) b\n     USING (label)) AS label_shift,\n  (SELECT model_id FROM active_model) AS model_id,\n  (SELECT EXTRACT(DAY FROM now() - promoted_at)::int FROM active_model) AS model_age_days,\n  (SELECT COUNT(*)::int FROM examples) AS total_examples;",
+        "options": {}
+      },
+      "id": "66f28c43-5d17-490d-9c42-b694b182b344",
+      "name": "Monitor Query",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        260,
+        1900
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const r = $input.first().json;\nconst esc = s => String(s === null || s === undefined ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst alerts = [];\nif (r.model_id === null || r.model_id === undefined) alerts.push('No active model. Predictions return 503 until a model is trained.');\nif (r.n_24h >= 20 && Number(r.low_confidence_rate) > 0.4) alerts.push('Low-confidence rate is ' + Math.round(r.low_confidence_rate * 100) + '% over ' + r.n_24h + ' predictions. The model may not cover new topics.');\nif (r.n_feedback_7d >= 20 && r.feedback_accuracy !== null && Number(r.feedback_accuracy) < 0.7) alerts.push('Accuracy on human feedback is ' + Math.round(r.feedback_accuracy * 100) + '% over ' + r.n_feedback_7d + ' corrections in 7 days.');\nif (r.n_24h >= 50 && r.n_baseline >= 50 && Number(r.label_shift) > 0.3) alerts.push('Label distribution shifted by ' + r.label_shift + ' (total variation) compared with the previous 7 days.');\nif (!alerts.length) return [];\nconst lines = ['📉 <b>ML service needs attention</b>', ''];\nfor (const a of alerts) lines.push('• ' + esc(a));\nlines.push('', 'Last 24 h: ' + r.n_24h + ' predictions, average confidence ' + r.avg_confidence + '. Model #' + (r.model_id ?? '-') + ', ' + (r.model_age_days ?? '-') + ' days old, ' + r.total_examples + ' training examples.');\nreturn [{ json: { text: lines.join('\\n') } }];"
+      },
+      "id": "5e09689b-2ff0-4442-b5c8-a9613f371089",
+      "name": "Format Monitor Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        1900
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "REPLACE_WITH_ALERT_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "89e4f40d-9793-41fd-9ec9-631c4bb6ce17",
+      "name": "Send Monitor Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        780,
+        1900
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ID",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "255a39fd-712c-485d-b7fa-d884e062f257",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        2300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const e = $input.first().json;\nconst wf = (e.workflow && e.workflow.name) || 'unknown workflow';\nconst node = (e.execution && e.execution.lastNodeExecuted) || 'unknown node';\nconst msg = (e.execution && e.execution.error && e.execution.error.message) || 'unknown error';\nconst url = (e.execution && e.execution.url) || '';\nreturn [{ json: { text: 'WORKFLOW ERROR\\n\\nWorkflow: ' + wf + '\\nFailed node: ' + node + '\\nError: ' + String(msg).slice(0, 500) + (url ? '\\n' + url : '') } }];"
+      },
+      "id": "0f8c31a0-fe29-46c6-a220-744292d80436",
+      "name": "Format Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        2300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "REPLACE_WITH_ALERT_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "d28bba0b-cdca-4e36-b2a0-81ac4488eccb",
+      "name": "Send Error Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        520,
+        2300
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ID",
+          "name": "Telegram account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Predict Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate Predict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Predict": {
+      "main": [
+        [
+          {
+            "node": "Predict Input Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Predict Input Valid?": {
+      "main": [
+        [
+          {
+            "node": "Load Active Model",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Bad Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Active Model": {
+      "main": [
+        [
+          {
+            "node": "Model Available?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Model Available?": {
+      "main": [
+        [
+          {
+            "node": "Predict",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond No Model",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Predict": {
+      "main": [
+        [
+          {
+            "node": "Log Prediction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Prediction": {
+      "main": [
+        [
+          {
+            "node": "Respond Prediction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Feedback Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate Feedback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Feedback": {
+      "main": [
+        [
+          {
+            "node": "Feedback Input Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Feedback Input Valid?": {
+      "main": [
+        [
+          {
+            "node": "Save Feedback",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Bad Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Feedback": {
+      "main": [
+        [
+          {
+            "node": "Respond Feedback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Examples Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate Examples",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Examples": {
+      "main": [
+        [
+          {
+            "node": "Examples Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Examples Valid?": {
+      "main": [
+        [
+          {
+            "node": "Insert Examples",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Bad Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Examples": {
+      "main": [
+        [
+          {
+            "node": "Respond Examples",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily Training Schedule": {
+      "main": [
+        [
+          {
+            "node": "Load Examples",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Train": {
+      "main": [
+        [
+          {
+            "node": "Load Examples",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Examples": {
+      "main": [
+        [
+          {
+            "node": "Load Champion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Champion": {
+      "main": [
+        [
+          {
+            "node": "Train & Evaluate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Train & Evaluate": {
+      "main": [
+        [
+          {
+            "node": "Model Trained?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Model Trained?": {
+      "main": [
+        [
+          {
+            "node": "Save Model",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Training Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Model": {
+      "main": [
+        [
+          {
+            "node": "Format Training Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Training Report": {
+      "main": [
+        [
+          {
+            "node": "Send Training Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily Monitor Schedule": {
+      "main": [
+        [
+          {
+            "node": "Monitor Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Monitor Query": {
+      "main": [
+        [
+          {
+            "node": "Format Monitor Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Monitor Alert": {
+      "main": [
+        [
+          {
+            "node": "Send Monitor Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Format Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Error": {
+      "main": [
+        [
+          {
+            "node": "Send Error Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Jakarta"
+  },
+  "active": false,
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
